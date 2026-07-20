@@ -1,0 +1,190 @@
+"""
+Onboarding + command conversation state machine.
+Each incoming WhatsApp message is handled by handle_message(), which returns
+the text to send back. State lives on the User row (models.py).
+"""
+
+import datetime
+from models import User
+from nutrition_calc import calorie_target, bmi, bmi_category, suggest_goal_from_bmi
+from ai_recommender import generate_meal_plan
+
+WELCOME = (
+    "Hi! I'm NutriRwanda, a nutrition assistant. I'll ask a few quick "
+    "questions, then suggest a full day of meals with nutrition facts, "
+    "tailored to you (weight loss, weight gain, or healthy maintenance).\n\n"
+    "This is general wellness guidance, not medical advice. If you have a "
+    "diagnosed condition, please also check with a health worker.\n\n"
+    "What's your name?"
+)
+
+HELP_TEXT = (
+    "Commands:\n"
+    "- \"plan\" -> get tomorrow's meal plan\n"
+    "- \"update\" -> redo your profile (weight, goal, etc.)\n"
+    "- \"help\" -> show this message"
+)
+
+ACTIVITY_OPTIONS = {
+    "1": "sedentary", "2": "light", "3": "moderate", "4": "active", "5": "very_active"
+}
+ACTIVITY_PROMPT = (
+    "What's your activity level?\n"
+    "1) Sedentary (little/no exercise)\n"
+    "2) Light (1-3 days/week)\n"
+    "3) Moderate (3-5 days/week)\n"
+    "4) Active (6-7 days/week)\n"
+    "5) Very active (hard daily training/physical job)\n"
+    "Reply with a number 1-5."
+)
+
+GOAL_OPTIONS = {
+    "1": "lose_weight", "2": "gain_weight", "3": "maintain", "4": "recover_malnutrition"
+}
+GOAL_PROMPT = (
+    "What's your main goal?\n"
+    "1) Lose weight\n"
+    "2) Gain weight\n"
+    "3) Maintain current weight\n"
+    "4) Recover from malnutrition / rebuild strength\n"
+    "Reply with a number 1-4. If unsure, reply \"suggest\" and I'll estimate from your BMI."
+)
+
+
+def handle_message(user: User, text: str) -> str:
+    text = (text or "").strip()
+    lower = text.lower()
+
+    # Global commands available once onboarded
+    if user.state == "READY":
+        if lower in ("help", "menu"):
+            return HELP_TEXT
+        if lower in ("update", "restart", "edit profile"):
+            user.reset_profile()
+            return "Sure, let's update your profile. What's your name?"
+        # default: treat anything else as a request for a plan
+        return _generate_and_format_plan(user)
+
+    if user.state == "NEW":
+        user.state = "ASK_NAME"
+        return WELCOME
+
+    if user.state == "ASK_NAME":
+        user.name = text[:100] if text else user.name
+        user.state = "ASK_AGE"
+        return f"Nice to meet you, {user.name or 'friend'}! How old are you (years)?"
+
+    if user.state == "ASK_AGE":
+        age = _parse_int(text)
+        if age is None or not (1 <= age <= 120):
+            return "Please send your age as a number, e.g. 34."
+        user.age = age
+        user.state = "ASK_SEX"
+        return "What's your sex? (reply 'male' or 'female' - this is used only for the calorie formula)"
+
+    if user.state == "ASK_SEX":
+        if lower not in ("male", "female", "m", "f"):
+            return "Please reply 'male' or 'female'."
+        user.sex = "male" if lower in ("male", "m") else "female"
+        user.state = "ASK_WEIGHT"
+        return "What's your current weight in kilograms? (e.g. 62)"
+
+    if user.state == "ASK_WEIGHT":
+        weight = _parse_float(text)
+        if weight is None or not (2 <= weight <= 400):
+            return "Please send your weight in kg as a number, e.g. 62.5."
+        user.weight_kg = weight
+        user.state = "ASK_HEIGHT"
+        return "What's your height in centimeters? (e.g. 165)"
+
+    if user.state == "ASK_HEIGHT":
+        height = _parse_float(text)
+        if height is None or not (40 <= height <= 250):
+            return "Please send your height in cm as a number, e.g. 165."
+        user.height_cm = height
+        user.state = "ASK_ACTIVITY"
+        return ACTIVITY_PROMPT
+
+    if user.state == "ASK_ACTIVITY":
+        choice = ACTIVITY_OPTIONS.get(text.strip())
+        if not choice:
+            return "Please reply with a number 1-5.\n\n" + ACTIVITY_PROMPT
+        user.activity_level = choice
+        user.state = "ASK_HEALTH"
+        return (
+            "Do you have any health conditions I should know about "
+            "(e.g. diabetes, high blood pressure, pregnancy, ulcers)? "
+            "If none, reply 'none'."
+        )
+
+    if user.state == "ASK_HEALTH":
+        user.health_conditions = text if lower not in ("none", "no", "n/a") else "none"
+        user.state = "ASK_DIET"
+        return (
+            "Any foods you avoid, dislike, or are allergic to, and what does "
+            "your usual diet look like these days? If nothing specific, reply 'none'."
+        )
+
+    if user.state == "ASK_DIET":
+        user.dietary_notes = text if lower not in ("none", "no", "n/a") else "none"
+        user.state = "ASK_GOAL"
+        return GOAL_PROMPT
+
+    if user.state == "ASK_GOAL":
+        if lower == "suggest":
+            b = bmi(user.weight_kg, user.height_cm)
+            user.goal = suggest_goal_from_bmi(b)
+        else:
+            choice = GOAL_OPTIONS.get(text.strip())
+            if not choice:
+                return "Please reply with a number 1-4, or 'suggest'.\n\n" + GOAL_PROMPT
+            user.goal = choice
+        user.state = "READY"
+        return _generate_and_format_plan(user, intro=True)
+
+    # Fallback: shouldn't normally happen
+    user.state = "NEW"
+    return handle_message(user, text)
+
+
+def _generate_and_format_plan(user: User, intro: bool = False) -> str:
+    b = bmi(user.weight_kg, user.height_cm)
+    category = bmi_category(b)
+    targets = calorie_target(
+        sex=user.sex, weight_kg=user.weight_kg, height_cm=user.height_cm,
+        age=user.age, activity_level=user.activity_level, goal=user.goal
+    )
+    profile = {
+        "age": user.age, "sex": user.sex, "weight_kg": user.weight_kg,
+        "height_cm": user.height_cm, "activity_level": user.activity_level,
+        "goal": user.goal, "health_conditions": user.health_conditions,
+        "dietary_notes": user.dietary_notes,
+    }
+
+    plan_text = generate_meal_plan(profile, targets)
+    user.last_plan_date = datetime.date.today().isoformat()
+
+    header = (
+        f"Your BMI is {b} ({category}). Daily target: ~{targets['target_kcal']} kcal "
+        f"({targets['protein_g']}g protein / {targets['carbs_g']}g carbs / {targets['fat_g']}g fat).\n\n"
+        "Here is tomorrow's suggested meal plan:\n\n"
+    )
+    footer = "\n\nSend \"plan\" anytime for a new day's plan, or \"update\" to change your profile."
+    if intro:
+        footer += "\nThis is general guidance, not a medical prescription."
+
+    return header + plan_text + footer
+
+
+def _parse_int(text: str):
+    try:
+        return int(text.strip())
+    except (ValueError, AttributeError):
+        return None
+
+
+def _parse_float(text: str):
+    try:
+        return float(text.strip().replace(",", "."))
+    except (ValueError, AttributeError):
+        return None
