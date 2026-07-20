@@ -1,0 +1,65 @@
+"""SQLAlchemy models. Works with SQLite (local dev) or Postgres (prod, e.g. Supabase)."""
+
+from datetime import datetime
+from sqlalchemy import (
+    Column, Integer, String, Float, DateTime, Text
+)
+from sqlalchemy.orm import declarative_base
+
+Base = declarative_base()
+
+# Onboarding states, in order
+STATES = [
+    "NEW",
+    "ASK_NAME",
+    "ASK_AGE",
+    "ASK_SEX",
+    "ASK_WEIGHT",
+    "ASK_HEIGHT",
+    "ASK_ACTIVITY",
+    "ASK_HEALTH",
+    "ASK_DIET",
+    "ASK_GOAL",
+    "READY",
+]
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True)
+    wa_id = Column(String, unique=True, nullable=False, index=True)  # WhatsApp phone number id
+    name = Column(String, nullable=True)
+
+    state = Column(String, default="NEW", nullable=False)
+
+    age = Column(Integer, nullable=True)
+    sex = Column(String, nullable=True)  # 'male' / 'female'
+    weight_kg = Column(Float, nullable=True)
+    height_cm = Column(Float, nullable=True)
+    activity_level = Column(String, nullable=True)
+    health_conditions = Column(Text, nullable=True)   # free text, e.g. "diabetes, hypertension" or "none"
+    dietary_notes = Column(Text, nullable=True)        # allergies, dislikes, vegetarian, usual diet, etc.
+    goal = Column(String, nullable=True)               # lose_weight / gain_weight / recover_malnutrition / maintain
+
+    last_plan_date = Column(String, nullable=True)     # ISO date of last generated plan, avoid spamming Claude
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def profile_complete(self) -> bool:
+        return all([
+            self.age, self.sex, self.weight_kg, self.height_cm,
+            self.activity_level, self.goal
+        ])
+
+    def reset_profile(self):
+        self.state = "ASK_NAME"
+        self.age = None
+        self.sex = None
+        self.weight_kg = None
+        self.height_cm = None
+        self.activity_level = None
+        self.health_conditions = None
+        self.dietary_notes = None
+        self.goal = None
