@@ -1,0 +1,102 @@
+"""
+Thin wrapper around Meta's WhatsApp Cloud API.
+
+Setup required (see README.md for full steps):
+  - WHATSAPP_TOKEN: permanent/temporary access token from Meta for Developers
+  - WHATSAPP_PHONE_NUMBER_ID: the "Phone number ID" of your WhatsApp Business number
+  - WHATSAPP_VERIFY_TOKEN: any string you choose, used during webhook verification
+  - WHATSAPP_APP_SECRET: your Meta App Secret, used to verify webhook signatures
+"""
+
+import hashlib
+import hmac
+import os
+import requests
+
+WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
+PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID")
+APP_SECRET = os.environ.get("WHATSAPP_APP_SECRET")
+GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v20.0")
+
+BASE_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
+
+MAX_MSG_LEN = 4000  # WhatsApp text messages cap at 4096 chars; leave margin
+
+
+def send_text(to_wa_id: str, body: str):
+    """Send one or more WhatsApp text messages (auto-splits long text)."""
+    chunks = _split_text(body)
+    responses = []
+    for chunk in chunks:
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to_wa_id,
+            "type": "text",
+            "text": {"body": chunk},
+        }
+        headers = {
+            "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        resp = requests.post(BASE_URL, json=payload, headers=headers, timeout=20)
+        responses.append(resp.json())
+        if resp.status_code >= 400:
+            print("WhatsApp send error:", resp.status_code, resp.text)
+    return responses
+
+
+def _split_text(text: str, max_len: int = MAX_MSG_LEN):
+    if len(text) <= max_len:
+        return [text]
+    chunks = []
+    while text:
+        if len(text) <= max_len:
+            chunks.append(text)
+            break
+        split_at = text.rfind("\n", 0, max_len)
+        if split_at == -1:
+            split_at = max_len
+        chunks.append(text[:split_at])
+        text = text[split_at:].lstrip("\n")
+    return chunks
+
+
+def verify_signature(payload_body: bytes, signature_header: str) -> bool:
+    """Verify X-Hub-Signature-256 header Meta sends with every webhook POST."""
+    if not APP_SECRET:
+        # If no app secret configured, skip verification (not recommended for prod)
+        return True
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
+    expected = hmac.new(
+        APP_SECRET.encode("utf-8"), payload_body, hashlib.sha256
+    ).hexdigest()
+    provided = signature_header.split("sha256=", 1)[1]
+    return hmac.compare_digest(expected, provided)
+
+
+def extract_incoming_message(payload: dict):
+    """
+    Parse a WhatsApp webhook POST body. Returns (wa_id, text, profile_name) or
+    (None, None, None) if this payload isn't a plain user text message
+    (e.g. it's a delivery/read status update, which should be ignored).
+    """
+    try:
+        entry = payload["entry"][0]
+        change = entry["changes"][0]["value"]
+        messages = change.get("messages")
+        if not messages:
+            return None, None, None
+        message = messages[0]
+        wa_id = message["from"]
+        profile_name = None
+        contacts = change.get("contacts")
+        if contacts:
+            profile_name = contacts[0].get("profile", {}).get("name")
+        if message.get("type") == "text":
+            text = message["text"]["body"]
+        else:
+            text = None  # images/audio/etc. not handled in MVP
+        return wa_id, text, profile_name
+    except (KeyError, IndexError, TypeError):
+        return None, None, None
