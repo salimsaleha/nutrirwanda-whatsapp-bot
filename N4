@@ -1,0 +1,81 @@
+"""
+Generates a next-day meal plan using the Claude API, grounded in:
+  - the user's profile (age, sex, weight, height, activity, health conditions, diet history)
+  - calculated calorie & macro targets (nutrition_calc.py)
+  - a local database of common Rwandan foods with real nutrition facts (foods_rwanda.json)
+
+Claude is told to prefer foods from the provided list (so nutrition facts are
+accurate and food is locally available/affordable) and to add clear safety
+disclaimers whenever a health condition is mentioned.
+"""
+
+import json
+import os
+from anthropic import Anthropic
+
+MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
+
+client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+with open(os.path.join(os.path.dirname(__file__), "foods_rwanda.json"), encoding="utf-8") as f:
+    FOOD_DB = json.load(f)
+
+
+SYSTEM_PROMPT = """You are a careful nutrition assistant embedded in a WhatsApp bot used in Rwanda to \
+fight malnutrition and support healthy weight goals. You are NOT a doctor.
+
+Rules:
+1. Prefer foods from the provided local food database (accurate nutrition facts, locally available, affordable). \
+You may include a small number of common foods not in the list, but clearly say their nutrition values are estimates.
+2. Always hit the given calorie and macro targets as closely as possible (+/-10%).
+3. Produce a full day plan: Breakfast, Lunch, Dinner, and 1-2 snacks, in simple everyday language.
+4. For each meal, list the foods with approximate portion sizes (in grams or common household measures like "1 cup"), \
+and give that meal's calories, protein, carbs, and fat.
+5. End with a daily total (calories, protein, carbs, fat) and compare it to the target.
+6. If the user reports a health condition (diabetes, hypertension, kidney disease, pregnancy, severe malnutrition/wasting, \
+etc.), adapt the plan sensibly (e.g. lower sugar/refined carbs for diabetes, lower salt for hypertension) AND add a short \
+disclaimer recommending they confirm the plan with a doctor, nurse, or nutritionist, especially before making major changes.
+7. If dietary notes mention allergies or foods they dislike/avoid, do not include those foods.
+8. Keep the whole reply under 3500 characters, in plain text (no markdown headers), formatted for reading on WhatsApp. \
+Use simple line breaks and short labels like "BREAKFAST:" instead of markdown.
+9. Be encouraging and non-judgmental in tone.
+"""
+
+
+def build_user_prompt(profile: dict, targets: dict) -> str:
+    foods_summary = "\n".join(
+        f"- {food['name_en']} ({food['name_rw']}): {food['kcal']} kcal, "
+        f"{food['protein_g']}g protein, {food['carbs_g']}g carbs, {food['fat_g']}g fat per 100g"
+        for food in FOOD_DB["foods"]
+    )
+
+    return f"""USER PROFILE
+Age: {profile.get('age')}
+Sex: {profile.get('sex')}
+Weight: {profile.get('weight_kg')} kg
+Height: {profile.get('height_cm')} cm
+Activity level: {profile.get('activity_level')}
+Goal: {profile.get('goal')}
+Health conditions: {profile.get('health_conditions') or 'none reported'}
+Dietary notes / allergies / usual diet: {profile.get('dietary_notes') or 'none reported'}
+
+DAILY TARGETS
+Calories: {targets['target_kcal']} kcal
+Protein: {targets['protein_g']} g
+Carbs: {targets['carbs_g']} g
+Fat: {targets['fat_g']} g
+
+LOCAL FOOD DATABASE (per 100g)
+{foods_summary}
+
+Create tomorrow's full-day meal plan for this person now."""
+
+
+def generate_meal_plan(profile: dict, targets: dict) -> str:
+    message = client.messages.create(
+        model=MODEL,
+        max_tokens=1500,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": build_user_prompt(profile, targets)}],
+    )
+    return "".join(block.text for block in message.content if block.type == "text")
